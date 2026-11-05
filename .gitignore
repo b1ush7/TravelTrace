@@ -18,11 +18,12 @@ htmlcov/
 *.db-wal
 *.sqlite*
 *.log
-/storage/
-/data/private/
 .vscode/
 .idea/
 .DS_Store
 Thumbs.db
-.gitkeep
 
+/storage/*
+!/storage/.gitkeep
+/data/private/*
+!/data/private/.gitkeep
