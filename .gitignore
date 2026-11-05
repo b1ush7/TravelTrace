@@ -1,1 +1,62 @@
-.vscode
+.vscode/
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.jks
+key.properties
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.egg-info/
+
+# Flutter / Android
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+build/
+.gradle/
+local.properties
+android/key.properties
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Local runtime and private data
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.log
+data/private/**
+!data/private/.gitkeep
+backend/storage/**
+!backend/storage/.gitkeep
+
+# Reference extraction / local exports
+pdf_extract/
+reference2/
+apifox_*备份.json
+
+/backend/data/private/**
+!/backend/data/private/.gitkeep
+/backend/storage/**
+!/backend/storage/.gitkeep
+
+
