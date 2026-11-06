@@ -27,3 +27,4 @@ Thumbs.db
 !/storage/.gitkeep
 /data/private/*
 !/data/private/.gitkeep
+.conda/
