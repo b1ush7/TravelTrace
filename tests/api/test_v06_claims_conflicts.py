@@ -80,6 +80,9 @@ def test_budget_conflict_relax_applies_immediately(client):
     budget = [row for row in conflicts.json() if row["type"] == "budget"]
     assert budget and budget[0]["severity"] == "medium"
     assert budget[0]["resolution_count"] >= 5
+    assert {"id", "type", "description", "status", "severity", "key_member_ids",
+            "resolution_count"} <= set(budget[0])
+    assert "code" not in budget[0] and "adjustment_options" not in budget[0]
     options = client.get(f"/api/v1/rooms/{room['id']}/conflicts/{budget[0]['id']}/resolutions",
                          headers=owner).json()
     assert options["room_version"] == client.get(f"/api/v1/rooms/{room['id']}", headers=owner).json()["version"]
