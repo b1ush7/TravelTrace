@@ -40,6 +40,7 @@ Swagger 页面为 http://127.0.0.1:8000/docs。测试默认使用隔离内存 SQ
 ## 契约与已知差异
 
 - 2026-11-13：Apifox 项目 9010615 的 75 个接口状态已全部由 `developing` 更新为 `testing`。
+- 2026-11-13：在 MySQL 9.7 临时实例上验证 `alembic upgrade head` → `downgrade base` → `upgrade head`，并跑通 31 个测试（含 3 个行锁并发测试）；SQLite 下为 28 passed / 3 skipped。
 - `GET /api/v1/rooms/{room_id}/conflicts` 的 Apifox 200 响应已由 `PlanIssue` 修正为 `Conflict`（带 `id/type/severity/key_member_ids/resolution_count`），与 v0.6.0 变更方案 M4 及代码一致。
 - `POST /api/v1/rooms/{room_id}/conflicts/refresh` 的 Apifox 请求仅含 `expected_room_version`，M5 要求增加 `include_theme_rules` / `include_interest_clash`。代码两者都接受（可选，默认 true），响应同时返回 `conflicts` 与 `issues`。
 - `MemberInterestProfile.member_id` 在 Apifox 描述为“房间成员 ID”，但接口是账户级的 `/me/interests`；当前返回用户 ID。
