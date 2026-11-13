@@ -187,3 +187,47 @@ def test_publish_requires_all_confirmations(client):
                                                  "expected_current_version_id": None,
                                                  "decision": "reject", "comment": "时间太赶"})
     assert rejected.status_code == 200 and rejected.json()["status"] == "rejected"
+
+
+def test_job_query_validation_activity_update_refresh_cancel(client):
+    owner, member, room = setup_room(client)
+    version = client.get(f"/api/v1/rooms/{room['id']}", headers=owner).json()["version"]
+    activity = add_activity(client, owner, room["id"], version, "八路军办事处", "八路军西安办事处纪念馆", 0)
+    current = client.get(f"/api/v1/rooms/{room['id']}", headers=owner).json()["version"]
+    updated = client.put(f"/api/v1/rooms/{room['id']}/activities/{activity['id']}", headers=owner, json={
+        "name": "八路军办事处（更新）", "place_name": "八路军西安办事处纪念馆",
+        "duration_minutes": 120, "estimated_cost_cny": 10, "cost_scope": "per_person",
+        "reservation_status": "confirmed", "expected_room_version": current})
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["duration_minutes"] == 120 and updated.json()["name"].endswith("（更新）")
+
+    current = updated.json()["room_version"]
+    job = client.post(f"/api/v1/rooms/{room['id']}/plan-jobs", headers=owner, json={
+        "expected_room_version": current, "activity_ids": [activity["id"]]})
+    assert job.status_code == 202, job.text
+    job_data = job.json()
+    assert job_data["status"] == "succeeded" and job_data["result_version_id"]
+
+    fetched = client.get(f"/api/v1/rooms/{room['id']}/jobs/{job_data['id']}", headers=member)
+    assert fetched.status_code == 200, fetched.text
+    assert fetched.json()["result_version_id"] == job_data["result_version_id"]
+    assert client.delete(f"/api/v1/rooms/{room['id']}/jobs/{job_data['id']}",
+                         headers=member).status_code == 409
+
+    validation = client.get(
+        f"/api/v1/rooms/{room['id']}/trip-versions/{job_data['result_version_id']}/validation",
+        headers=member)
+    assert validation.status_code == 200, validation.text
+    assert validation.json()["outcome"] in {"feasible", "data_missing", "unknown"}
+
+    current = client.get(f"/api/v1/rooms/{room['id']}", headers=owner).json()["version"]
+    cancelled = client.post(
+        f"/api/v1/rooms/{room['id']}/trip-versions/{job_data['result_version_id']}/cancel",
+        headers=owner, json={"expected_room_version": current, "expected_current_version_id": None})
+    assert cancelled.status_code == 200, cancelled.text
+    assert cancelled.json()["status"] == "cancelled"
+
+    refreshed = client.post(f"/api/v1/rooms/{room['id']}/conflicts/refresh", headers=member,
+                            json={"expected_room_version": current})
+    assert refreshed.status_code == 200, refreshed.text
+    assert refreshed.json()["room_version"] >= current
