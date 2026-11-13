@@ -1,51 +1,54 @@
 # 旅迹 TravelTrace
 
-多人旅游协商与规划系统的后端项目。客户端在独立仓库开发。
+多人旅游协商与规划系统的后端。OpenAPI 0.6.0，已按 Apifox「旅游规划」项目 9010615 的 75 个接口完成路由实现（11 个 testing + 64 个 developing 的代码落地）。
 
-计划使用 Python、FastAPI、DeepSeek API、LangGraph 和约束优化。已实现第一阶段账号、房间、邀请码与分页消息接口。其他规划和 AI 接口仍为待实现设计。
+## 能力范围
+
+- 账号、房间、邀请、成员、讨论消息（原有 11 个接口）。
+- 兴趣标签：字典、本人档案、统计、房间聚合（public/room 参与聚合，private 排除）。
+- 主题游：主题列表/详情/行程包、房间主题设置；红色西安 Demo 主题含 5 个点位、规则包、事实包（source + observed_at）。
+- 成员需求与确认：claims 生命周期、参与区间、冲突刷新/解法/应用；relax 仅涉本人立即生效，其余生成待确认版本。
+- 行程规划与版本：候选活动、plan-jobs、replan-jobs、任务查询/取消、版本确认/发布/取消、当前版本、校验、下一步、overview。
+- 系统触达：负一屏卡片、流体云 live-state、推送订阅、通知列表与 ack。
+- 复盘与模板：归档生成复盘、只读复盘、我的模板、从模板创建房间。
+- 分享：脱敏分享链接创建/撤销、公开读取；不含成员姓名、预算、标签。
+- 团购、聊天导入、需求提取任务：契约与存储已落地；提取模型未接入，任务返回成功但不生成 claims。
+- 地点/知识：内置 Demo 地点与主题事实检索。
 
 ## 目录
 
-- app/api/v1：接口路由汇总。
-- app/core：配置、认证和错误处理。
-- app/db：数据库基础能力。
-- app/modules：账号、房间、讨论、需求、协商、地点、规划、行程、团购和知识模块。
-- app/ai：Agent、工作流、工具与检索。
-- app/integrations：模型和地图等外部服务适配。
-- migrations：数据库迁移。
-- tests：单元、接口和集成测试。
-- data：种子数据与测试样例，private 内容不提交。
-- storage：本地运行产物，不提交。
-
-需求见《设计方案.md》，接口设计见 Apifox「旅游规划」项目。空目录通过 `.gitkeep` 保留。
-
-## 协作流程
-
-讨论 → 本人确认需求 → 冲突提案与投票 → 记录决定 → 生成候选行程 → 校验与全员确认 → 房主发布。需求或成员变化后旧候选与批准失效。客户端在独立项目中开发。接口契约当前为 OpenAPI 0.4.0，Apifox 状态保持开发中。
-
+- `app/api/v1`：接口路由汇总。
+- `app/core`：配置、认证和错误处理。
+- `app/db`：模型与会话。
+- `app/modules`：auth、rooms、discussions、interests、themes、claims、conflicts、plans、proposals、reach、sharing、retrospectives、deals、imports、places。
+- `migrations`：`0001` 初始表，`0002` v0.6.0 标签/主题/冲突/触达/复盘等表与字段。
+- `tests`：接口、迁移与 MySQL 并发测试。
 
 ## 本地运行
 
-使用 Conda 项目环境（Windows）：
-
-```powershell
-conda activate D:\TravelTrace\.conda
-pip install -e ".[dev]"
-Copy-Item .env.example .env
+```bash
+python -m venv .venv
+.venv/bin/pip install -e ".[dev]"
+cp .env.example .env   # 配置 MySQL 与随机 JWT 密钥
+.venv/bin/python -m alembic upgrade head
+.venv/bin/python -m uvicorn app.main:create_app --factory --host 127.0.0.1 --port 8000
+.venv/bin/python -m pytest -q
 ```
 
-编辑 `.env`，配置你自己的 MySQL 连接（MySQL 8.0+，InnoDB、utf8mb4）和随机 JWT 密钥。不要提交 `.env`。随后在项目根目录执行：
+Swagger 页面为 http://127.0.0.1:8000/docs。测试默认使用隔离内存 SQLite；设置 `TRAVELTRACE_TEST_DATABASE_URL` 后会创建随机 `tt_test_` 前缀 MySQL 库并在结束后删除。
 
-```powershell
-python -m alembic upgrade head
-python -m uvicorn app.main:create_app --factory --host 127.0.0.1 --port 8000
-python -m pytest -q
-```
+## 契约与已知差异
 
-Swagger 页面为 http://127.0.0.1:8000/docs。默认测试使用隔离内存 SQLite，只验证接口与业务流程，不代替 MySQL 并发测试。设置 `TRAVELTRACE_TEST_DATABASE_URL` 后，测试会创建随机 `tt_test_` 前缀数据库，结束后删除该临时库，不使用已有业务表；测试账号须有建库与删库权限，仅连接专用测试实例。
+- Apifox 中 `GET /api/v1/rooms/{room_id}/conflicts` 的 200 响应仍指向 `PlanIssue`（code/message/severity/member_ids/activity_ids/adjustment_options），而 v0.6.0 变更方案 M4 要求返回带 `id/type/severity/key_member_ids/resolution_count` 的 `Conflict`。代码按设计返回 `Conflict[]`；建议在 Apifox 中把该响应改为 `Conflict` 后再转 testing。
+- `POST /api/v1/rooms/{room_id}/conflicts/refresh` 的 Apifox 请求仅含 `expected_room_version`，M5 要求增加 `include_theme_rules` / `include_interest_clash`。代码两者都接受（可选，默认 true），响应同时返回 `conflicts` 与 `issues`。
+- `MemberInterestProfile.member_id` 在 Apifox 描述为“房间成员 ID”，但接口是账户级的 `/me/interests`；当前返回用户 ID。
+- OpenAPI `info.version` 在 Apifox 导出中仍为 0.5.0，代码为 0.6.0。
+- 规划器为确定性启发式（日期+时长+固定承诺），未接入 CP-SAT；地图链接为 Demo 域名；推送仅落库，未接真实推送网关。
 
-用户名为 3～32 位英文、数字或下划线，大小写归一；密码为 8～128 位。每个账号自行注册；创建房间时必须填写目的地和起止日期，房主自动成为成员，房间最多六人。邀请码由房主生成，默认有效期 24 小时；消息采用 after/limit 游标分页轮询。重复加入返回已有成员，不重复增加房间版本。生产环境需提供 HTTPS，并在公开服务入口配置登录限流。
+## 数据与安全
 
-当前数据库方案为 MySQL，使用 PyMySQL 驱动；事务隔离级别为 READ COMMITTED，时间统一按 UTC 存储，接口返回带时区时间。迁移版本为 0001。2026-11-06 离线测试 13 项通过，3 项真实数据库并发测试待数据库服务启动后验证；MySQL 真库迁移尚未执行。原 PostgreSQL 数据不自动搬迁或删除。
-
-排障：修改 `.env` 后须手动重启服务，`--reload` 不负责重载该配置文件。数据库连接及连接池等待默认各限制为 5 秒，网络读写等待各限制为 8 秒、InnoDB 锁等待限制为 3 秒（网络超时不等同于服务端 SQL 执行超时）；数据库不可用时返回带 request_id 的 503 DATABASE_UNAVAILABLE，不输出凭证。开发启动可使用 `python -m uvicorn app.main:create_app --factory --reload --reload-dir app`，避免扫描项目环境目录。
+- 时间统一 UTC 存储，接口返回含时区时间；房间时区默认 `Asia/Shanghai`。
+- 写接口使用 `expected_room_version` / `expected_version` / `expected_proposal_version` 乐观锁，冲突返回 409。
+- 锁屏与卡片默认隐藏成员姓名和预算；分享页只返回生效版本的脱敏活动。
+- 兴趣 private 标签只存本人，不进入房间聚合与分享。
+- 聊天导入必须显式 `consent_confirmed=true`；`discard_after_extraction` 在同步提取后不保留原文。

@@ -5,12 +5,19 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
+class InterestSummary(BaseModel):
+    common_count: int = 0
+    conflict_count: int = 0
+
+
 class CreateRoom(BaseModel):
     model_config = ConfigDict(extra="forbid")
     name: str = Field(min_length=1, max_length=80)
     destination: str = Field(min_length=1, max_length=100)
     start_date: date
     end_date: date
+    theme_code: str | None = Field(default=None, max_length=64)
+    interest_tag_codes: list[str] = Field(default_factory=list, max_length=30)
 
     @field_validator("name", "destination")
     @classmethod
@@ -18,6 +25,13 @@ class CreateRoom(BaseModel):
         if not value.strip():
             raise ValueError("内容不能为空")
         return value.strip()
+
+    @field_validator("interest_tag_codes")
+    @classmethod
+    def unique_tags(cls, value):
+        if len(set(value)) != len(value):
+            raise ValueError("兴趣标签不能重复")
+        return value
 
     @model_validator(mode="after")
     def check_dates(self):
@@ -38,6 +52,8 @@ class RoomResponse(BaseModel):
     status: str
     created_at: datetime
     confirmation_rule: Literal["all_active_members"] = "all_active_members"
+    theme_code: str | None = None
+    interest_summary: InterestSummary = Field(default_factory=InterestSummary)
 
 
 class MemberResponse(BaseModel):
@@ -72,3 +88,24 @@ class JoinRoom(BaseModel):
         if value is not None and not value.strip():
             raise ValueError("显示名不能为空")
         return value.strip() if value else value
+
+class TravelWindowIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    starts_at: datetime
+    ends_at: datetime
+    time_zone: str = Field(min_length=1, max_length=64)
+    expected_room_version: int = Field(ge=1)
+
+
+class TravelWindowOut(BaseModel):
+    starts_at: datetime
+    ends_at: datetime
+    time_zone: str
+    room_version: int
+
+class RevokedCount(BaseModel):
+    revoked_count: int
+
+
+class LeftRoom(BaseModel):
+    left: bool

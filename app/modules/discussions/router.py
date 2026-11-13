@@ -8,7 +8,7 @@ from app.core.security import current_user
 from app.db.models import Message, Room, User
 from app.db.session import get_session
 from app.modules.discussions.schemas import CreateMessage, MessagePage, MessageResponse
-from app.modules.rooms.service import require_member
+from app.modules.rooms.service import ensure_writable, require_member
 
 router = APIRouter(tags=["讨论与导入"])
 
@@ -16,6 +16,7 @@ router = APIRouter(tags=["讨论与导入"])
 @router.post("/rooms/{room_id}/messages", response_model=MessageResponse, status_code=201, summary="提交房间讨论消息")
 def send(room_id: UUID, body: CreateMessage, user: User = Depends(current_user), session: Session = Depends(get_session)):
     member = require_member(session, room_id, user.id)
+    ensure_writable(session.get(Room, room_id))
     # Serialize inserts within a room so a later committed sequence cannot
     # advance the polling cursor past an earlier, still uncommitted message.
     session.scalar(select(Room).where(Room.id == room_id).with_for_update())
