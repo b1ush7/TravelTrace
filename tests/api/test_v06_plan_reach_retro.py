@@ -91,7 +91,8 @@ def test_full_plan_publish_reach_share_archive_flow(client):
     card = next(item for item in cards.json() if item["room_id"] == room["id"])
     assert card["current_version_id"] == version_id
     assert card["days_to_start"] == (date(2026, 12, 5) - date.today()).days
-    assert card["next_meeting"]["place_name"] == "西安"
+    # The meeting point is the first scheduled activity's place, not the city.
+    assert card["next_meeting"]["place_name"] == "八路军西安办事处纪念馆"
 
     overview = client.get(f"/api/v1/rooms/{room['id']}/overview", headers=member)
     assert overview.status_code == 200, overview.text

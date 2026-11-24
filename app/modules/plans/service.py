@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import copy
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 from urllib.parse import quote
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
@@ -11,14 +11,17 @@ from sqlalchemy.orm import Session
 
 from app.core.errors import ApiError
 from app.db.models import (
-    ActivityFact, Claim, Conflict, Job, Member, Participation, PlanVersion, Room, User, utcnow,
+    ActivityFact, Claim, Conflict, Job, Member, Participation, PlanVersion, Room, utcnow,
 )
 from app.modules.claims.service import claim_out
 from app.modules.conflicts.service import issues_from_conflicts
 from app.modules.interests.service import room_overview
+from app.modules.plans.context import build_context
 from app.modules.plans.schemas import (
     ActivityOut, NextStepOut, PlanValidationOut, PlanVersionOut, PlanningJobOut, RoomOverviewV06Out,
 )
+from app.modules.plans.solver import SolveResult, solve
+from app.modules.plans.travel import travel_minutes
 from app.modules.rooms.service import present_room
 from app.modules.themes import catalog as themes
 
@@ -84,48 +87,71 @@ def _active_members(session: Session, room_id: UUID) -> list[Member]:
                                                      Member.status == "active")).all())
 
 
-def _schedule(room: Room, facts: list[ActivityFact]) -> list[dict]:
-    tz = ZoneInfo(room.time_zone or DEFAULT_TZ)
-    day = room.start_date
-    cursor = datetime.combine(day, time(9, 0), tzinfo=tz)
-    members = []
-    items = [{
-        "id": str(uuid4()), "activity_id": None, "title": "集合出发", "place_name": room.destination,
-        "map_place_id": None, "starts_at": datetime.combine(day, time(8, 30), tzinfo=tz).isoformat(),
-        "ends_at": cursor.isoformat(), "member_ids": members, "branch_id": None, "kind": "meeting",
-        "commitment": "flexible", "execution_state": "planned", "estimated_cost_cny": 0.0,
-        "source_note": "行程骨架自动生成的集合点",
-    }]
-    for fact in facts:
-        duration = max(fact.duration_minutes or 30, 15)
-        end = cursor + timedelta(minutes=duration)
-        if cursor.hour >= 19 or end.date() > cursor.date():
-            day = min(day + timedelta(days=1), room.end_date)
-            cursor = datetime.combine(day, time(9, 0), tzinfo=tz)
-            end = cursor + timedelta(minutes=duration)
-        items.append({
-            "id": str(uuid4()), "activity_id": str(fact.id), "title": fact.name,
-            "place_name": fact.place_name, "map_place_id": fact.place_id,
-            "starts_at": cursor.isoformat(), "ends_at": end.isoformat(), "member_ids": members,
-            "branch_id": None, "kind": "activity",
-            "commitment": "fixed" if (fact.reservation_status == "confirmed" or fact.reserved_start) else "flexible",
-            "execution_state": "planned", "estimated_cost_cny": fact.estimated_cost_cny,
-            "source_note": fact.source_note,
-        })
-        cursor = end + timedelta(minutes=30)
-    return items
+def _item_payload(item, room: Room) -> dict:
+    """Map a solver item onto the plan-version JSON contract."""
+    slot = item.slot
+    return {
+        "id": str(uuid4()), "activity_id": str(slot.activity_id) if slot else None,
+        "title": item.title, "place_name": item.place_name,
+        "map_place_id": slot.place_id if slot else None,
+        "starts_at": item.start.isoformat(), "ends_at": item.end.isoformat(),
+        "member_ids": [str(value) for value in item.member_ids],
+        "branch_id": item.branch_id, "kind": item.kind,
+        "commitment": "fixed" if slot and (slot.reservation_status == "confirmed"
+                                           or slot.fixed_start) else "flexible",
+        "execution_state": "planned",
+        "estimated_cost_cny": slot.cost_cny if slot else 0.0,
+        "source_note": slot.source_note if slot else "行程骨架自动生成的集合点",
+    }
 
 
-def _connections(items: list[dict]) -> list[dict]:
+def _connections(items: list[dict], by_activity: dict) -> list[dict]:
+    """Travel legs between consecutive items, with an explicit unknown source."""
     result = []
     for first, second in zip(items, items[1:]):
         if first["kind"] != "activity" and second["kind"] != "activity":
             continue
+        first_slot = by_activity.get(first["activity_id"])
+        second_slot = by_activity.get(second["activity_id"])
+        minutes = None
+        source = "unknown"
+        if second_slot is not None:
+            minutes, source = travel_minutes(first_slot, second_slot)
+        if source == "unknown" and first_slot is not None:
+            # A placeholder keeps the timeline realistic, but \`travel_minutes\`
+            # stays null so validation still refuses to publish on it.
+            minutes = None
         result.append({
             "from_id": first["id"], "to_id": second["id"], "member_ids": second["member_ids"],
-            "kind": "travel", "travel_minutes": 20, "source": "estimate",
+            "kind": "travel", "travel_minutes": minutes, "source": source,
         })
     return result
+
+
+def _estimate_cost(items: list[dict], slots: dict) -> tuple[float, list[dict]]:
+    """Total cost plus per-member budget utilisation.
+
+    `per_person` costs are multiplied by the attendee count; `total` costs are
+    spread across attendees. The old planner summed raw values regardless of
+    scope, so group totals and per-head budgets disagreed.
+    """
+    total = 0.0
+    per_member: dict[str, float] = {}
+    for item in items:
+        if item["kind"] != "activity":
+            continue
+        slot = slots.get(item["activity_id"])
+        if slot is None:
+            continue
+        people = max(len(item["member_ids"]), 1)
+        amount = slot.cost_cny if slot.cost_scope == "per_person" else slot.cost_cny / people
+        attendees = [str(value) for value in item["member_ids"]]
+        share = slot.cost_cny * people if slot.cost_scope == "per_person" else slot.cost_cny
+        total += share
+        for member_id in attendees:
+            per_member[member_id] = per_member.get(member_id, 0.0) + amount
+    return total, [{"member_id": member_id, "estimated_cny": round(value, 2)}
+                   for member_id, value in sorted(per_member.items())]
 
 
 def build_plan(session: Session, room: Room, member: Member, body, job: Job) -> PlanVersion:
@@ -140,29 +166,32 @@ def build_plan(session: Session, room: Room, member: Member, body, job: Job) -> 
     if theme_code and themes.city_scope(theme_code) != room.destination:
         raise ApiError(422, "THEME_CITY_MISMATCH", "主题与目的地不匹配")
     members = _active_members(session, room.id)
-    member_ids = [str(item.id) for item in members]
-    items = _schedule(room, facts)
-    for item in items:
-        item["member_ids"] = member_ids
-    connections = _connections(items)
-    connections_members = [item["member_ids"] for item in connections]
-    for index, connection in enumerate(connections):
-        connection["member_ids"] = connections_members[index]
+    context = build_context(session, room, facts)
+    result = solve(context, allow_split=bool(body.allow_split))
+    slots = {str(slot.activity_id): slot for slot in context.slots}
+    items = [_item_payload(item, room) for item in result.items]
+    connections = _connections(items, slots)
     participation = [{"member_id": str(row.member_id), "joins_at": row.joins_at.isoformat(),
                       "leaves_at": row.leaves_at.isoformat(), "allow_solo": row.allow_solo,
                       "room_version": room.version}
                      for row in session.scalars(select(Participation).where(
                          Participation.room_id == room.id)).all()]
-    estimated = sum(float(item.get("estimated_cost_cny") or 0) for item in items)
+    estimated, per_member = _estimate_cost(items, slots)
+    issues = plan_issues(result, context)
+    outcome = _outcome(result, issues)
     version = PlanVersion(
         room_id=room.id, proposer_member_id=member.id, base_version_id=None,
         input_room_version=room.version, status="awaiting_confirmation", theme_code=theme_code,
         activities=items, connections=connections,
         split_segments=[], participation=participation, estimated_cost_cny=estimated,
-        member_budgets=[], unknowns=[], impact={
-            "changed_activity_ids": [], "affected_member_ids": [], "required_member_ids": [],
-            "changed_commitment_ids": [], "cost_delta_cny": None, "time_delta_minutes": None,
-            "unknowns": [] if participation else ["参与区间未填写"],
+        member_budgets=per_member, unknowns=result.unknowns,
+        impact={
+            "changed_activity_ids": [item["id"] for item in items],
+            "affected_member_ids": sorted({value for item in items for value in item["member_ids"]}),
+            "required_member_ids": [str(item.id) for item in members],
+            "changed_commitment_ids": [],
+            "cost_delta_cny": None, "time_delta_minutes": None,
+            "unknowns": result.unknowns, "issues": issues,
         },
         approvals=[{"member_id": str(item.id), "decision": "pending", "decided_at": None, "comment": ""}
                    for item in members],
@@ -173,10 +202,11 @@ def build_plan(session: Session, room: Room, member: Member, body, job: Job) -> 
     session.add(version)
     session.flush()
     job.status = "succeeded"
-    job.outcome = "feasible"
+    job.outcome = outcome
     job.stage = "finished"
     job.result_version_id = version.id
-    job.progress_message = "候选已生成，等待成员确认"
+    job.progress_message = ("候选已生成，等待成员确认" if outcome == "feasible"
+                            else "候选已生成，但存在需要解决的问题")
     room.status = "planning"
     room.updated_at = utcnow()
     session.commit()
@@ -192,14 +222,172 @@ def planning_job_out(job: Job) -> PlanningJobOut:
                           result_version_id=job.result_version_id, issues=issues)
 
 
+def _issue(code: str, message: str, severity: str, *, member_ids=None,
+           activity_ids=None, options=None) -> dict:
+    return {"code": code, "message": message, "severity": severity,
+            "member_ids": [str(value) for value in (member_ids or [])],
+            "activity_ids": [str(value) for value in (activity_ids or [])],
+            "adjustment_options": options or []}
+
+
+def plan_issues(result: SolveResult, context) -> list[dict]:
+    """Turn a solve result into the contract's issue list."""
+    issues: list[dict] = []
+    for item in result.excluded:
+        issues.append(_issue(
+            item.code, item.message, "error" if item.blocking else "warning",
+            member_ids=item.member_ids, activity_ids=[item.slot.activity_id],
+            options=["relax", "split", "defer"] if item.blocking else ["defer"]))
+    for slot in result.unplaced:
+        issues.append(_issue(
+            "ACTIVITY_UNPLACED", f"{slot.name} 在可用时间窗内排不下，请调整时间窗或时长",
+            "warning", activity_ids=[slot.activity_id], options=["resize", "defer", "skip"]))
+    for member in context.members:
+        if not member.has_participation:
+            issues.append(_issue(
+                "PARTICIPATION_MISSING", "参与区间未填写，暂按整段可用处理", "warning",
+                member_ids=[member.member_id], options=["confirm_plan"]))
+    return issues
+
+
+def _outcome(result: SolveResult, issues: list[dict]) -> str:
+    if any(item["severity"] == "error" for item in issues):
+        return "infeasible"
+    if result.data_missing or result.unplaced:
+        return "data_missing"
+    return "feasible"
+
+
+def evaluate(version: PlanVersion, context) -> list[dict]:
+    """Re-check a stored version against the same constraints the solver used.
+
+    Both `validation` and `publish` call this, so the feasibility gate cannot
+    drift away from what the planner actually guaranteed.
+    """
+    issues: list[dict] = []
+    slots = {str(slot.activity_id): slot for slot in context.slots}
+    by_member = {member.member_id: member for member in context.members}
+    items = activities(version)
+    for item in items:
+        start = parse_dt(item.get("starts_at"))
+        end = parse_dt(item.get("ends_at"))
+        if start is None or end is None:
+            issues.append(_issue("ACTIVITY_TIME_UNKNOWN", f"{item.get('title', '活动')} 缺少时间",
+                                 "error", activity_ids=[item.get("id")]))
+            continue
+        slot = slots.get(str(item.get("activity_id")))
+        for raw in item.get("member_ids", []):
+            member = by_member.get(_as_uuid(raw))
+            if member is None:
+                continue
+            if not member.covers(start, end):
+                issues.append(_issue(
+                    "MEMBER_TIME_CONFLICT",
+                    f"{item.get('title', '活动')} 超出成员可参加时间",
+                    "error", member_ids=[member.member_id], activity_ids=[item.get("id")],
+                    options=["shift", "split", "leave"]))
+        if slot is not None:
+            if slot.fixed_start is not None and start != slot.fixed_start:
+                issues.append(_issue(
+                    "RESERVATION_MISMATCH",
+                    f"{item.get('title', '活动')} 与预约时间不一致",
+                    "error", activity_ids=[item.get("id")], options=["shift", "defer"]))
+            if end > slot.latest_end:
+                issues.append(_issue(
+                    "ACTIVITY_WINDOW_EXCEEDED",
+                    f"{item.get('title', '活动')} 超出活动时间窗",
+                    "error", activity_ids=[item.get("id")], options=["shift", "resize", "defer"]))
+    activity_item_ids = {str(item.get("id")) for item in items if item.get("kind") == "activity"}
+    for connection in version.connections or []:
+        if connection.get("kind") != "travel":
+            continue
+        # The synthetic meeting point has no coordinates, so the leg into the
+        # first activity carries no real origin. Only inter-activity legs are
+        # evidence we are expected to have.
+        if str(connection.get("from_id")) not in activity_item_ids:
+            continue
+        if connection.get("travel_minutes") is None:
+            issues.append(_issue(
+                "TRAVEL_TIME_UNKNOWN", "缺少坐标，无法估算两点交通时间", "error",
+                activity_ids=[connection.get("to_id")], options=["defer", "replace"]))
+    # Re-run the solver against the stored activity set. If it cannot place an
+    # activity that the version claims to contain, validation must say so
+    # instead of reporting a plan as feasible that the planner could not build.
+    if context.slots:
+        replay = solve(context)
+        for excluded in replay.excluded:
+            issues.append(_issue(
+                excluded.code, excluded.message,
+                "error" if excluded.blocking else "warning",
+                member_ids=excluded.member_ids, activity_ids=[excluded.slot.activity_id],
+                options=["relax", "split", "defer"] if excluded.blocking else ["defer"]))
+        for slot in replay.unplaced:
+            issues.append(_issue(
+                "ACTIVITY_UNPLACED", f"{slot.name} 在可用时间窗内排不下，请调整时间窗或时长",
+                "error", activity_ids=[slot.activity_id], options=["resize", "defer", "skip"]))
+    total = 0.0
+    for item in items:
+        if item.get("kind") != "activity":
+            continue
+        slot = slots.get(str(item.get("activity_id")))
+        if slot is None:
+            continue
+        people = max(len(item.get("member_ids", [])), 1)
+        total += slot.cost_cny * people if slot.cost_scope == "per_person" else slot.cost_cny
+        for raw in item.get("member_ids", []):
+            member = by_member.get(_as_uuid(raw))
+            if member is None or member.budget_cny is None:
+                continue
+            share = slot.cost_cny if slot.cost_scope == "per_person" else slot.cost_cny / people
+            if share > member.budget_cny:
+                issues.append(_issue(
+                    "BUDGET_EXCEEDED",
+                    f"「{item.get('title', '活动')}」单项 {int(share)} 元超出成员人均预算 {int(member.budget_cny)} 元",
+                    "error", member_ids=[member.member_id], activity_ids=[item.get("id")],
+                    options=["relax", "replace", "skip"]))
+    return issues
+
+
+def _as_uuid(value):
+    try:
+        return UUID(str(value))
+    except (TypeError, ValueError):
+        return None
+
+
 def validation(session: Session, version: PlanVersion) -> PlanValidationOut:
     conflicts = list(session.scalars(select(Conflict).where(
         Conflict.room_id == version.room_id, Conflict.status == "open")).all())
     issues = [item.model_dump(mode="json") for item in issues_from_conflicts(conflicts)]
     high = any(item["severity"] == "error" for item in issues)
-    return PlanValidationOut(version_id=version.id,
-                             outcome="infeasible" if high else ("unknown" if not version.activities else "feasible"),
-                             issues=issues)
+
+    activity_ids = []
+    for item in version.activities or []:
+        parsed = _as_uuid(item.get("activity_id"))
+        if parsed is not None:
+            activity_ids.append(parsed)
+    room = session.get(Room, version.room_id)
+    data_missing = False
+    if room is not None:
+        facts = list(session.scalars(select(ActivityFact).where(
+            ActivityFact.room_id == version.room_id,
+            ActivityFact.id.in_(activity_ids))).all()) if activity_ids else []
+        context = build_context(session, room, facts)
+        issues.extend(evaluate(version, context))
+        data_missing = context.data_missing
+        for member in context.members:
+            if not member.has_participation:
+                issues.append(_issue(
+                    "PARTICIPATION_MISSING", "参与区间未填写，暂按整段可用处理", "warning",
+                    member_ids=[member.member_id], options=["confirm_plan"]))
+    errors = any(item["severity"] == "error" for item in issues)
+    if errors or high:
+        outcome = "infeasible"
+    elif data_missing or not version.activities:
+        outcome = "unknown" if not version.activities else "data_missing"
+    else:
+        outcome = "feasible"
+    return PlanValidationOut(version_id=version.id, outcome=outcome, issues=issues)
 
 
 def publish(session: Session, room: Room, version: PlanVersion, actor: Member) -> PlanVersion:
