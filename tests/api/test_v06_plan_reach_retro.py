@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from uuid import UUID
 
 from sqlalchemy import select
@@ -90,7 +90,7 @@ def test_full_plan_publish_reach_share_archive_flow(client):
     assert cards.status_code == 200, cards.text
     card = next(item for item in cards.json() if item["room_id"] == room["id"])
     assert card["current_version_id"] == version_id
-    assert card["days_to_start"] == 22
+    assert card["days_to_start"] == (date(2026, 12, 5) - date.today()).days
     assert card["next_meeting"]["place_name"] == "西安"
 
     overview = client.get(f"/api/v1/rooms/{room['id']}/overview", headers=member)

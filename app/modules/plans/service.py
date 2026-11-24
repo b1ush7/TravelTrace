@@ -196,7 +196,7 @@ def validation(session: Session, version: PlanVersion) -> PlanValidationOut:
     conflicts = list(session.scalars(select(Conflict).where(
         Conflict.room_id == version.room_id, Conflict.status == "open")).all())
     issues = [item.model_dump(mode="json") for item in issues_from_conflicts(conflicts)]
-    high = any(row.severity == "error" for row in conflicts)
+    high = any(item["severity"] == "error" for item in issues)
     return PlanValidationOut(version_id=version.id,
                              outcome="infeasible" if high else ("unknown" if not version.activities else "feasible"),
                              issues=issues)
@@ -211,6 +211,14 @@ def publish(session: Session, room: Room, version: PlanVersion, actor: Member) -
     rejected = [item for item in (version.approvals or []) if item.get("decision") in {"reject", "request_changes"}]
     if pending or rejected:
         raise ApiError(409, "CONFIRMATION_INCOMPLETE", "仍有成员未确认或要求修改")
+    check = validation(session, version)
+    if check.outcome == "infeasible":
+        reasons = list(dict.fromkeys(
+            issue["message"] for issue in check.issues if issue.get("severity") == "error"))
+        detail = "；".join(reasons)[:240]
+        message = (f"存在未解决的高优先级冲突，暂不能发布：{detail}。请先解决冲突再发布"
+                   if detail else "行程校验未通过，暂不能发布")
+        raise ApiError(409, "PLAN_INFEASIBLE", message)
     previous = current_published(session, room.id)
     if previous is not None:
         previous.status = "superseded"

@@ -17,6 +17,21 @@ from app.modules.themes import catalog as themes
 
 HARD = "hard"
 
+CONFLICT_SEVERITIES = {"low", "medium", "high"}
+_SEVERITY_ALIASES = {"error": "high", "warning": "medium", "info": "low"}
+
+
+def normalize_severity(value: str | None) -> str:
+    """Keep stored conflict severity inside the low/medium/high contract.
+
+    Theme rules and map issues use error/warning/info; legacy rows may still
+    contain those values. Normalize at every boundary instead of leaking them
+    into ConflictOut (which only accepts low/medium/high).
+    """
+    if value in CONFLICT_SEVERITIES:
+        return value
+    return _SEVERITY_ALIASES.get(value or "", "medium")
+
 
 def _dt(value) -> datetime | None:
     if value is None or value == "":
@@ -160,7 +175,7 @@ def _theme_specs(session: Session, room: Room, names: dict[UUID, str]) -> list[d
             "claim_ids": [],
             "affected_member_ids": [str(item) for item in names],
             "key_member_ids": [],
-            "severity": "error",
+            "severity": "high",
             "dedupe_key": "theme:RED_MONDAY_CLOSED",
         })
     stale = [fact for fact in themes.facts(room.theme_code) if fact["stale"]]
@@ -171,7 +186,7 @@ def _theme_specs(session: Session, room: Room, names: dict[UUID, str]) -> list[d
             "claim_ids": [],
             "affected_member_ids": [str(item) for item in names],
             "key_member_ids": [],
-            "severity": "warning",
+            "severity": "medium",
             "dedupe_key": "theme:STALE_FACT",
         })
     return result
@@ -233,7 +248,7 @@ def refresh_conflicts(session: Session, room: Room, *, include_theme_rules: bool
             row.claim_ids = spec["claim_ids"]
             row.affected_member_ids = spec["affected_member_ids"]
             row.key_member_ids = spec["key_member_ids"]
-            row.severity = spec["severity"]
+            row.severity = normalize_severity(spec["severity"])
     for key, row in existing.items():
         if key not in seen and row.status == "open":
             row.status = "resolved"
@@ -306,7 +321,7 @@ def conflict_out(row: Conflict) -> ConflictOut:
         id=row.id, type=row.type, description=row.description,
         claim_ids=[UUID(str(item)) for item in (row.claim_ids or [])],
         affected_member_ids=[UUID(str(item)) for item in (row.affected_member_ids or [])],
-        status=row.status, severity=row.severity,
+        status=row.status, severity=normalize_severity(row.severity),
         key_member_ids=[UUID(str(item)) for item in (row.key_member_ids or [])],
         resolution_count=row.resolution_count,
     )
@@ -316,7 +331,7 @@ def issues_from_conflicts(rows: list[Conflict]) -> list[PlanIssueOut]:
     return [PlanIssueOut(
         code=row.dedupe_key.upper().replace(":", "_"),
         message=row.description,
-        severity="error" if row.severity == "error" else "warning",
+        severity="error" if normalize_severity(row.severity) == "high" else "warning",
         member_ids=[UUID(str(item)) for item in (row.affected_member_ids or [])],
         activity_ids=[],
         adjustment_options=["relax", "replace", "shift", "split", "defer"],

@@ -139,3 +139,86 @@ def test_participation_and_version_conflict(client):
     body["expected_room_version"] = first.json()["room_version"]
     second = client.put(f"/api/v1/rooms/{room['id']}/members/me/participation", headers=owner, json=body)
     assert second.status_code == 200 and second.json()["room_version"] == room["version"] + 2
+
+
+def add_activity(client, headers, room_id, expected_room_version):
+    created = client.post(f"/api/v1/rooms/{room_id}/activities", headers=headers, json={
+        "name": "陕西历史博物馆", "place_name": "陕西历史博物馆", "duration_minutes": 120,
+        "estimated_cost_cny": 0, "cost_scope": "per_person", "reservation_status": "confirmed",
+        "expected_room_version": expected_room_version})
+    assert created.status_code == 201, created.text
+    return created.json()
+
+
+def plan_and_approve(client, owner, member, room):
+    room_version = client.get(f"/api/v1/rooms/{room['id']}", headers=owner).json()["version"]
+    activity = add_activity(client, owner, room["id"], room_version)
+    current = activity["room_version"]
+    job = client.post(f"/api/v1/rooms/{room['id']}/plan-jobs", headers=owner, json={
+        "expected_room_version": current, "activity_ids": [activity["id"]]})
+    assert job.status_code == 202, job.text
+    version_id = job.json()["result_version_id"]
+    assert version_id
+    for headers in (owner, member):
+        confirmed = client.post(f"/api/v1/rooms/{room['id']}/trip-versions/{version_id}/confirmation",
+                                headers=headers, json={
+                                    "expected_room_version": current,
+                                    "expected_current_version_id": None,
+                                    "decision": "approve"})
+        assert confirmed.status_code == 200, confirmed.text
+    return version_id, current
+
+
+def publish(client, owner, room, version_id, room_version):
+    return client.post(f"/api/v1/rooms/{room['id']}/trip-versions/{version_id}/publish",
+                       headers=owner, json={"expected_room_version": room_version,
+                                            "expected_current_version_id": None})
+
+
+def test_high_conflict_blocks_publish_even_after_confirmations(client):
+    owner = account(client, "owner")
+    room = make_room(client, owner)
+    member, _ = add_member(client, owner, room["id"], "bob")
+    claim(client, owner, room["id"], "budget", {"amount_cny": 1200, "scope": "per_person"})
+    claim(client, member, room["id"], "budget", {"amount_cny": 400, "scope": "per_person"})
+    conflicts = client.get(f"/api/v1/rooms/{room['id']}/conflicts", headers=owner)
+    assert conflicts.status_code == 200, conflicts.text
+    budget = next(row for row in conflicts.json() if row["type"] == "budget")
+    assert budget["severity"] == "high"
+
+    version_id, current = plan_and_approve(client, owner, member, room)
+    blocked = publish(client, owner, room, version_id, current)
+    assert blocked.status_code == 409, blocked.text
+    assert blocked.json()["code"] == "PLAN_INFEASIBLE"
+    assert "高优先级冲突" in blocked.json()["message"]
+    detail = client.get(f"/api/v1/rooms/{room['id']}/trip-versions/{version_id}", headers=owner)
+    assert detail.json()["status"] == "awaiting_confirmation"
+
+
+def test_medium_conflict_does_not_block_publish(client):
+    owner = account(client, "owner")
+    room = make_room(client, owner)
+    member, _ = add_member(client, owner, room["id"], "bob")
+    claim(client, owner, room["id"], "budget", {"amount_cny": 1000, "scope": "per_person"})
+    claim(client, member, room["id"], "budget", {"amount_cny": 600, "scope": "per_person"})
+    conflicts = client.get(f"/api/v1/rooms/{room['id']}/conflicts", headers=owner).json()
+    budget = next(row for row in conflicts if row["type"] == "budget")
+    assert budget["severity"] == "medium"
+
+    version_id, current = plan_and_approve(client, owner, member, room)
+    published = publish(client, owner, room, version_id, current)
+    assert published.status_code == 200, published.text
+    assert published.json()["status"] == "published"
+
+
+def test_theme_conflict_severity_stays_in_public_contract(client):
+    owner = account(client, "owner")
+    room = client.post("/api/v1/rooms", headers=owner, json={
+        "name": "周一西安", "destination": "西安", "start_date": "2026-12-07",
+        "end_date": "2026-12-08", "theme_code": "red_tour"}).json()
+    refreshed = client.post(f"/api/v1/rooms/{room['id']}/conflicts/refresh", headers=owner,
+                            json={"expected_room_version": room["version"]})
+    assert refreshed.status_code == 200, refreshed.text
+    theme = next(row for row in refreshed.json()["conflicts"] if "周一" in row["description"])
+    assert theme["severity"] == "high"
+    assert refreshed.json()["issues"][0]["severity"] in {"error", "warning", "unknown"}
